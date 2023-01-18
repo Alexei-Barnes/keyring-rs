@@ -1,4 +1,3 @@
-use byteorder::{ByteOrder, LittleEndian};
 use std::iter::once;
 use std::mem::MaybeUninit;
 use std::str;
@@ -9,13 +8,32 @@ use winapi::shared::winerror::{
 };
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::wincred::{
-    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_MAX_CREDENTIAL_BLOB_SIZE,
-    CRED_MAX_GENERIC_TARGET_NAME_LENGTH, CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH,
-    CRED_PERSIST_ENTERPRISE, CRED_TYPE_GENERIC, PCREDENTIALW, PCREDENTIAL_ATTRIBUTEW,
+    CredFree, CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_MAX_GENERIC_TARGET_NAME_LENGTH,
+    CRED_MAX_STRING_LENGTH, CRED_MAX_USERNAME_LENGTH, CRED_PERSIST_ENTERPRISE, CRED_TYPE_GENERIC,
 };
 
 use super::credential::{Credential, CredentialApi, CredentialBuilder, CredentialBuilderApi};
 use super::error::{Error as ErrorCode, Result};
+
+#[cfg(all(feature = "windows-utf8", feature = "windows-utf16"))]
+compile_error!("features `keyring/windows_utf8` and `keyring/windows_utf16` are mutually exclusive, use `--no-default-features` to build without Windows UTF16 credentials.");
+
+#[cfg(feature = "windows-utf16")]
+use byteorder::{ByteOrder, LittleEndian};
+
+#[cfg(feature = "windows-utf16")]
+use winapi::um::wincred::{
+    CredDeleteW as CredDelete, CredReadW as CredRead, CredWriteW as CredWrite,
+    CREDENTIALW as CREDENTIAL, PCREDENTIALW as PCREDENTIAL,
+    PCREDENTIAL_ATTRIBUTEW as PCREDENTIAL_ATTRIBUTE,
+};
+
+#[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+use winapi::um::wincred::{
+    CredDeleteA as CredDelete, CredReadA as CredRead, CredWriteA as CredWrite,
+    CREDENTIALA as CREDENTIAL, PCREDENTIALA as PCREDENTIAL,
+    PCREDENTIAL_ATTRIBUTEA as PCREDENTIAL_ATTRIBUTE,
+};
 
 /// Windows has only one credential store, and each credential is identified
 /// by a single string called the "target name".  But generic credentials
@@ -35,18 +53,22 @@ impl CredentialApi for WinCredential {
     // PCREDENTIALW = *mut CREDENTIALW
     fn set_password(&self, password: &str) -> Result<()> {
         self.validate_attributes(password)?;
-        let mut username = to_wstr(&self.username);
-        let mut target_name = to_wstr(&self.target_name);
-        let mut target_alias = to_wstr(&self.target_alias);
-        let mut comment = to_wstr(&self.comment);
+        let mut username = to_win_buffer(&self.username);
+        let mut target_name = to_win_buffer(&self.target_name);
+        let mut target_alias = to_win_buffer(&self.target_alias);
+        let mut comment = to_win_buffer(&self.comment);
         // Password strings are converted to UTF-16, because that's the native
         // charset for Windows strings.  This allows editing of the password in
         // the Windows native UI.  But the storage for the credential is actually
         // a little-endian blob, because passwords can contain anything.
-        let blob_u16 = to_wstr_no_null(password);
-        let mut blob = vec![0; blob_u16.len() * 2];
-        LittleEndian::write_u16_into(&blob_u16, &mut blob);
-        let blob_len = blob.len() as u32;
+        let buffer = to_win_buffer_no_null(password);
+
+        #[cfg(feature = "windows-utf16")]
+        let mut blob = to_utf16_little_endian(buffer);
+
+        #[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+        let mut blob: Vec<u8> = buffer.into_iter().map(|b| b as u8).collect();
+
         let flags = 0;
         let cred_type = CRED_TYPE_GENERIC;
         let persist = CRED_PERSIST_ENTERPRISE;
@@ -56,14 +78,14 @@ impl CredentialApi for WinCredential {
             dwHighDateTime: 0,
         };
         let attribute_count = 0;
-        let attributes: PCREDENTIAL_ATTRIBUTEW = std::ptr::null_mut();
-        let mut credential = CREDENTIALW {
+        let attributes: PCREDENTIAL_ATTRIBUTE = std::ptr::null_mut();
+        let mut credential = CREDENTIAL {
             Flags: flags,
             Type: cred_type,
             TargetName: target_name.as_mut_ptr(),
             Comment: comment.as_mut_ptr(),
             LastWritten: last_written,
-            CredentialBlobSize: blob_len,
+            CredentialBlobSize: blob.len() as u32,
             CredentialBlob: blob.as_mut_ptr(),
             Persist: persist,
             AttributeCount: attribute_count,
@@ -72,9 +94,9 @@ impl CredentialApi for WinCredential {
             UserName: username.as_mut_ptr(),
         };
         // raw pointer to credential, is coerced from &mut
-        let p_credential: PCREDENTIALW = &mut credential;
+        let p_credential: PCREDENTIAL = &mut credential;
         // Call windows API
-        match unsafe { CredWriteW(p_credential, 0) } {
+        match unsafe { CredWrite(p_credential, 0) } {
             0 => Err(decode_error()),
             _ => Ok(()),
         }
@@ -86,9 +108,9 @@ impl CredentialApi for WinCredential {
 
     fn delete_password(&self) -> Result<()> {
         self.validate_attributes("")?;
-        let target_name = to_wstr(&self.target_name);
+        let target_name = to_win_buffer(&self.target_name);
         let cred_type = CRED_TYPE_GENERIC;
-        match unsafe { CredDeleteW(target_name.as_ptr(), cred_type, 0) } {
+        match unsafe { CredDelete(target_name.as_ptr(), cred_type, 0) } {
             0 => Err(decode_error()),
             _ => Ok(()),
         }
@@ -131,9 +153,7 @@ impl WinCredential {
                 CRED_MAX_STRING_LENGTH,
             ));
         }
-        // We're going to store the password as UTF-16, so make sure to consider its length as UTF-16.
-        // `encode_utf16` gives us the count of `u16`s, so we multiply by 2 to get the number of bytes.
-        if password.encode_utf16().count() * 2 > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
+        if password_len(password) > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
             return Err(ErrorCode::TooLong(
                 String::from("password"),
                 CRED_MAX_CREDENTIAL_BLOB_SIZE,
@@ -148,7 +168,7 @@ impl WinCredential {
 
     fn extract_from_platform<F, T>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(&CREDENTIALW) -> Result<T>,
+        F: FnOnce(&CREDENTIAL) -> Result<T>,
     {
         self.validate_attributes("")?;
         let mut p_credential = MaybeUninit::uninit();
@@ -156,9 +176,9 @@ impl WinCredential {
         // The allocation happens in the `CredReadW` call below.
         let result = {
             let cred_type = CRED_TYPE_GENERIC;
-            let target_name = to_wstr(&self.target_name);
+            let target_name = to_win_buffer(&self.target_name);
             unsafe {
-                CredReadW(
+                CredRead(
                     target_name.as_ptr(),
                     cred_type,
                     0,
@@ -177,7 +197,7 @@ impl WinCredential {
                 // first we remove the "uninitialized" guard from around it, then we reinterpret it as a
                 // pointer to the right structure type.
                 let p_credential = unsafe { p_credential.assume_init() };
-                let w_credential: CREDENTIALW = unsafe { *p_credential };
+                let w_credential: CREDENTIAL = unsafe { *p_credential };
                 // Now we can apply the passed extractor function to the credential.
                 let result = f(&w_credential);
                 // Finally, we free the allocated credential.
@@ -189,12 +209,12 @@ impl WinCredential {
         }
     }
 
-    fn extract_credential(w_credential: &CREDENTIALW) -> Result<Self> {
+    fn extract_credential(w_credential: &CREDENTIAL) -> Result<Self> {
         Ok(Self {
-            username: unsafe { from_wstr(w_credential.UserName) },
-            target_name: unsafe { from_wstr(w_credential.TargetName) },
-            target_alias: unsafe { from_wstr(w_credential.TargetAlias) },
-            comment: unsafe { from_wstr(w_credential.Comment) },
+            username: unsafe { from_win_buffer(w_credential.UserName) },
+            target_name: unsafe { from_win_buffer(w_credential.TargetName) },
+            target_alias: unsafe { from_win_buffer(w_credential.TargetAlias) },
+            comment: unsafe { from_win_buffer(w_credential.Comment) },
         })
     }
 
@@ -263,33 +283,62 @@ impl CredentialBuilderApi for WinCredentialBuilder {
     }
 }
 
-fn extract_password(credential: &CREDENTIALW) -> Result<String> {
-    // get password blob
+fn extract_password(credential: &CREDENTIAL) -> Result<String> {
     let blob_pointer: *const u8 = credential.CredentialBlob;
     let blob_len: usize = credential.CredentialBlobSize as usize;
     let blob = unsafe { std::slice::from_raw_parts(blob_pointer, blob_len) };
-    // 3rd parties may write credential data with an odd number of bytes,
-    // so we make sure that we don't try to decode those as utf16
-    if blob.len() % 2 != 0 {
-        let err = ErrorCode::BadEncoding(blob.to_vec());
-        return Err(err);
-    }
-    // Now we know this _can_ be a UTF-16 string, so convert it to
-    // as UTF-16 vector and then try to decode it.
-    let mut blob_u16 = vec![0; blob.len() / 2];
-    LittleEndian::read_u16_into(blob, &mut blob_u16);
-    String::from_utf16(&blob_u16).map_err(|_| ErrorCode::BadEncoding(blob.to_vec()))
+    decode_password_blob(&blob)
 }
 
-fn to_wstr(s: &str) -> Vec<u16> {
+fn password_len(data: &str) -> usize {
+    #[cfg(feature = "windows-utf16")]
+    return data.encode_utf16().count() * 2;
+
+    #[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+    return data.len();
+}
+
+fn decode_password_blob(data: &[u8]) -> Result<String> {
+    #[cfg(feature = "windows-utf16")]
+    return from_utf16_little_endian(data);
+
+    #[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+    return from_utf8(data);
+}
+
+#[cfg(feature = "windows-utf16")]
+fn from_utf16_little_endian(data: &[u8]) -> Result<String> {
+    // 3rd parties may write credential data with an odd number of bytes,
+    // so we make sure that we don't try to decode those as utf16
+    if data.len() % 2 != 0 {
+        let err = ErrorCode::BadEncoding(data.to_vec());
+        return Err(err);
+    }
+
+    let mut blob = vec![0; data.len() / 2];
+    LittleEndian::read_u16_into(data, &mut blob);
+    String::from_utf16(&blob).map_err(|_| ErrorCode::BadEncoding(data.to_vec()))
+}
+
+#[cfg(feature = "windows-utf16")]
+fn to_utf16_little_endian(data: Vec<u16>) -> Vec<u8> {
+    let mut blob = vec![0; data.len() * 2];
+    LittleEndian::write_u16_into(&data, &mut blob);
+    blob
+}
+
+#[cfg(feature = "windows-utf16")]
+fn to_win_buffer(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(once(0)).collect()
 }
 
-fn to_wstr_no_null(s: &str) -> Vec<u16> {
+#[cfg(feature = "windows-utf16")]
+fn to_win_buffer_no_null(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-unsafe fn from_wstr(ws: *const u16) -> String {
+#[cfg(feature = "windows-utf16")]
+unsafe fn from_win_buffer(ws: *const u16) -> String {
     // null pointer case, return empty string
     if ws.is_null() {
         return String::new();
@@ -298,6 +347,33 @@ unsafe fn from_wstr(ws: *const u16) -> String {
     let len = (0..).take_while(|&i| *ws.offset(i) != 0).count();
     let slice = std::slice::from_raw_parts(ws, len);
     String::from_utf16_lossy(slice)
+}
+
+#[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+fn from_utf8(data: &[u8]) -> Result<String> {
+    String::from_utf8(data.to_vec()).map_err(|_| ErrorCode::BadEncoding(data.to_vec()))
+}
+
+#[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+fn to_win_buffer(s: &str) -> Vec<i8> {
+    s.as_bytes().into_iter().map(|b| *b as i8).chain(once(0)).collect()
+}
+
+#[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+fn to_win_buffer_no_null(s: &str) -> Vec<i8> {
+    s.as_bytes().into_iter().map(|b| *b as i8).collect()
+}
+
+#[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+unsafe fn from_win_buffer(ws: *const i8) -> String {
+    // null pointer case, return empty string
+    if ws.is_null() {
+        return String::new();
+    }
+    // this code from https://stackoverflow.com/a/48587463/558006
+    let len = (0..).take_while(|&i| *ws.offset(i) != 0).count();
+    let slice = std::slice::from_raw_parts(ws as *const u8, len);
+    String::from_utf8_lossy(slice).to_string()
 }
 
 #[derive(Debug)]
@@ -347,16 +423,17 @@ mod tests {
         crate::tests::entry_from_constructor(WinCredential::new_with_target, service, user)
     }
 
+    #[cfg(features = "windows-utf16")]
     #[test]
     fn test_bad_password() {
-        fn make_platform_credential(password: &mut Vec<u8>) -> CREDENTIALW {
+        fn make_platform_credential(password: &mut Vec<u8>) -> CREDENTIAL {
             let last_written = FILETIME {
                 dwLowDateTime: 0,
                 dwHighDateTime: 0,
             };
             let attribute_count = 0;
-            let attributes: PCREDENTIAL_ATTRIBUTEW = std::ptr::null_mut();
-            CREDENTIALW {
+            let attributes: PCREDENTIAL_ATTRIBUTE = std::ptr::null_mut();
+            CREDENTIAL {
                 Flags: 0,
                 Type: CRED_TYPE_GENERIC,
                 TargetName: std::ptr::null_mut(),
@@ -414,7 +491,10 @@ mod tests {
             ("target", CRED_MAX_GENERIC_TARGET_NAME_LENGTH),
             ("target alias", CRED_MAX_STRING_LENGTH),
             ("comment", CRED_MAX_STRING_LENGTH),
+            #[cfg(feature = "windows-utf16")]
             ("password", CRED_MAX_CREDENTIAL_BLOB_SIZE / 2),
+            #[cfg(all(feature = "windows-utf8", feature = "windows-utf16"))]
+            ("password", CRED_MAX_CREDENTIAL_BLOB_SIZE),
         ] {
             let long_string = generate_random_string_of_len(1 + len as usize);
             let mut bad_cred = cred.clone();
@@ -427,7 +507,12 @@ mod tests {
                 "password" => password = &long_string,
                 other => panic!("unexpected attribute: {}", other),
             }
+
+            #[cfg(feature = "windows-utf16")]
             let expected_length = if attr == "password" { len * 2 } else { len };
+            #[cfg(all(feature = "windows-utf8", not(feature = "windows-utf16")))]
+            let expected_length = len;
+
             validate_attribute_too_long(
                 bad_cred.validate_attributes(password),
                 attr,
@@ -436,6 +521,7 @@ mod tests {
         }
     }
 
+    #[cfg(features = "windows-utf16")]
     #[test]
     fn test_password_valid_only_after_conversion_to_utf16() {
         let cred = WinCredential {

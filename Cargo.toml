@@ -11,13 +11,15 @@ edition = "2021"
 exclude = [".github/"]
 
 [features]
-default = ["linux-default-secret-service-rt-async-io-crypto-rust"]
+default = ["linux-default-secret-service-rt-async-io-crypto-rust", "windows-utf16"]
 linux-default-secret-service-rt-async-io-crypto-rust = ["secret-service/rt-async-io-crypto-rust"]
 linux-default-secret-service-rt-tokio-crypto-rust = ["secret-service/rt-tokio-crypto-rust"]
 linux-default-secret-service-rt-async-io-crypto-openssl = ["secret-service/rt-async-io-crypto-openssl"]
 linux-default-secret-service-rt-tokio-crypto-openssl = ["secret-service/rt-tokio-crypto-openssl"]
 linux-no-secret-service = ["linux-default-keyutils"]
 linux-default-keyutils = []
+windows-utf16 = []
+windows-utf8 = []
 
 [dependencies]
 lazy_static = "1"
